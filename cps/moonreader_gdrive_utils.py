@@ -81,29 +81,31 @@ class UserGdriveAuth:
             return self.drive
             
         try:
-            # Create temporary settings file for this user
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as temp_settings:
-                settings_content = f"""
-client_config_backend: file
-client_config_file: {CLIENT_SECRETS}
-
-save_credentials: False
-save_credentials_backend: file
-
-get_refresh_token: True
-
-oauth_scope:
-  - https://www.googleapis.com/auth/drive
-"""
-                temp_settings.write(settings_content)
-                temp_settings_path = temp_settings.name
+            # Load client config from file
+            import json
+            with open(CLIENT_SECRETS, 'r') as f:
+                client_config = json.load(f)
             
-            # Create GoogleAuth for this user
-            gauth = GoogleAuth(settings_file=temp_settings_path)
+            # Create GoogleAuth with direct settings
+            settings = {
+                'client_config_backend': 'settings',
+                'client_config': client_config['web'],
+                'save_credentials': False,
+                'oauth_scope': ['https://www.googleapis.com/auth/drive']
+            }
+            gauth = GoogleAuth(settings=settings)
             
             # Load user's credentials from database
             credentials_data = json.loads(self.credentials_record.credentials_json)
-            gauth.credentials = gauth.from_json(json.dumps(credentials_data))
+            
+            # Create credentials object
+            try:
+                from oauth2client.client import OAuth2Credentials
+                gauth.credentials = OAuth2Credentials.from_json(json.dumps(credentials_data))
+            except ImportError:
+                # Try google-auth-oauthlib for newer versions
+                from google.oauth2.credentials import Credentials
+                gauth.credentials = Credentials.from_authorized_user_info(credentials_data)
             
             # Check if credentials need refresh
             if gauth.access_token_expired:
@@ -124,12 +126,6 @@ oauth_scope:
             
             # Create and cache drive instance
             self.drive = GoogleDrive(gauth)
-            
-            # Clean up temp file
-            try:
-                os.unlink(temp_settings_path)
-            except OSError:
-                pass
                 
             return self.drive
             

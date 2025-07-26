@@ -248,11 +248,13 @@ def db_configuration():
 @admin_required
 def configuration():
     gdrive_status = get_gdrive_status()
+    user_gdrive_status = get_user_gdrive_status(current_user.id)
     return render_title_template("config_edit.html",
                                  config=config,
                                  provider=oauthblueprints,
                                  feature_support=feature_support,
                                  gdrive_status=gdrive_status,
+                                 user_gdrive_status=user_gdrive_status,
                                  get_user_gdrive_status=get_user_gdrive_status,
                                  title=_("Basic Configuration"), page="config")
 
@@ -328,9 +330,12 @@ def moonreader_gdrive_auth():
         }
         gauth = GoogleAuth(settings=settings)
         
-        # Get the OAuth flow and add user_id to state parameter
+        # Get the OAuth flow with explicit redirect URI
         gauth.GetFlow()
+        gauth.flow.redirect_uri = url_for('admin.moonreader_gdrive_callback', _external=True, _scheme='https')
         gauth.flow.params['state'] = f"moonreader_user_{current_user.id}"
+        gauth.flow.params['prompt'] = 'consent'  # Force consent to get refresh token
+        gauth.flow.params['access_type'] = 'offline'  # Request offline access
         
         auth_url = gauth.GetAuthUrl()
             
@@ -385,19 +390,45 @@ def moonreader_gdrive_callback():
         }
         gauth = GoogleAuth(settings=settings)
         gauth.GetFlow()
+        gauth.flow.redirect_uri = url_for('admin.moonreader_gdrive_callback', _external=True, _scheme='https')
         
         credentials = gauth.flow.step2_exchange(auth_code)
         
-        # Get user email from credentials
-        user_email = getattr(credentials, 'id_token', {}).get('email', 'Unknown')
-        if not user_email or user_email == 'Unknown':
-            # Try to get it from the token info
+        # Get user email from Google Drive API
+        user_email = 'Unknown'
+        
+        try:
+            # Use the credentials to get user info from Google Drive API
+            from pydrive2.drive import GoogleDrive
+            from pydrive2.auth import GoogleAuth
+            
+            # Create a temporary GoogleAuth with the credentials
+            temp_gauth = GoogleAuth(settings=settings)
+            temp_gauth.credentials = credentials
+            
+            # Create GoogleDrive instance
+            drive = GoogleDrive(temp_gauth)
+            
+            # Get user info using the about API
+            about = drive.GetAbout()
+            user_email = about.get('user', {}).get('emailAddress', 'Unknown')
+            
+        except Exception as e:
+            log.warning(f"Could not get user email from Google Drive API: {e}")
+            
+            # Fallback: try to get from token info
             try:
                 import json
                 token_info = json.loads(credentials.to_json())
-                user_email = token_info.get('id_token', {}).get('email', 'Unknown')
+                id_token_data = token_info.get('id_token')
+                if id_token_data and isinstance(id_token_data, dict):
+                    user_email = id_token_data.get('email', 'Unknown')
             except:
-                user_email = 'Unknown'
+                pass
+        
+        # If still no email, use a default
+        if user_email == 'Unknown':
+            user_email = f'user_{user_id}@unknown'
         
         # Store credentials in database
         existing_creds = ub.session.query(ub.UserGdriveCredentials).filter(
@@ -432,7 +463,7 @@ def moonreader_gdrive_callback():
         return redirect(url_for('admin.configuration'))
 
 
-@admi.route("/admin/moonreader_gdrive_disconnect", methods=["POST"])
+@admi.route("/admin/disconnect_moonreader_gdrive", methods=["POST"])
 @user_login_required
 def disconnect_moonreader_gdrive():
     """Remove user's Google Drive connection"""

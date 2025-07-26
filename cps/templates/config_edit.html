@@ -165,11 +165,9 @@
             {% if user_gdrive.authenticated %}
               <div class="alert alert-success">
                 <i class="fa fa-check"></i> {{_('Connected to')}} {{ user_gdrive.email }}
-                <form method="post" action="{{ url_for('admin.disconnect_moonreader_gdrive') }}" style="display: inline;">
-                  <button type="submit" class="btn btn-sm btn-danger pull-right">
-                    {{_('Disconnect')}}
-                  </button>
-                </form>
+                <button type="button" class="btn btn-sm btn-danger pull-right" onclick="disconnectMoonreaderGdrive()">
+                  {{_('Disconnect')}}
+                </button>
               </div>
               
               <!-- Folder Selection -->
@@ -650,5 +648,23 @@ $(document).ready(function() {
          });
     });
 });
+
+// Disconnect Moonreader Google Drive function (global scope)
+function disconnectMoonreaderGdrive() {
+    if (confirm('{{_("Are you sure you want to disconnect from Google Drive?")}}')) {
+        var form = document.createElement('form');
+        form.method = 'POST';
+        form.action = '{{ url_for("admin.disconnect_moonreader_gdrive") }}';
+        
+        var csrfToken = document.createElement('input');
+        csrfToken.type = 'hidden';
+        csrfToken.name = 'csrf_token';
+        csrfToken.value = '{{ csrf_token() }}';
+        form.appendChild(csrfToken);
+        
+        document.body.appendChild(form);
+        form.submit();
+    }
+}
 </script>
 {% endblock %}
