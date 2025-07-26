@@ -114,6 +114,8 @@ class _Settings(_Base):
     config_use_google_drive = Column(Boolean, default=False)
     config_google_drive_folder = Column(String)
     config_google_drive_watch_changes_response = Column(JSON, default={})
+    
+    config_moonreader_sync = Column(Boolean, default=False)
 
     config_use_goodreads = Column(Boolean, default=False)
     config_goodreads_api_key = Column(String)

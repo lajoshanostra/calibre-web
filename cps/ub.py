@@ -501,6 +501,35 @@ def receive_before_flush(session, flush_context, instances):
             change.ub_shelf.last_modified = datetime.now(timezone.utc)
 
 
+# Baseclass representing per-user Google Drive credentials for Moonreader
+class UserGdriveCredentials(Base):
+    __tablename__ = 'user_gdrive_credentials'
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('user.id'))
+    access_token = Column(String)
+    refresh_token = Column(String)
+    credentials_json = Column(String)  # Full OAuth credentials as JSON
+    folder_id = Column(String)         # Selected Google Drive folder ID  
+    folder_name = Column(String)       # Human readable folder name
+    authenticated = Column(Boolean, default=False)
+    email = Column(String)             # Google account email for display
+    created_date = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    last_refresh = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+# Baseclass representing Moonreader sync tracking
+class MoonreaderSyncStatus(Base):
+    __tablename__ = 'moonreader_sync_status'
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('user.id'))
+    book_id = Column(Integer)
+    last_kobo_sync = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    last_moonreader_sync = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    position_checksum = Column(String)
+
+
 # Baseclass representing Downloads from calibre-web in app.db
 class Downloads(Base):
     __tablename__ = 'downloads'

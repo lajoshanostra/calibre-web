@@ -50,6 +50,7 @@ from .helper import check_valid_domain, send_test_mail, reset_password, generate
     valid_email, check_username
 from .embed_helper import get_calibre_binarypath
 from .gdriveutils import is_gdrive_ready, gdrive_support
+from datetime import datetime, timezone
 from .render_template import render_title_template, get_sidebar_config
 from .services.worker import WorkerThread
 from .usermanagement import user_login_required
@@ -246,10 +247,13 @@ def db_configuration():
 @user_login_required
 @admin_required
 def configuration():
+    gdrive_status = get_gdrive_status()
     return render_title_template("config_edit.html",
                                  config=config,
                                  provider=oauthblueprints,
                                  feature_support=feature_support,
+                                 gdrive_status=gdrive_status,
+                                 get_user_gdrive_status=get_user_gdrive_status,
                                  title=_("Basic Configuration"), page="config")
 
 
@@ -274,6 +278,289 @@ def calibreweb_alive():
     return "", 200
 
 
+@admi.route("/admin/moonreader_gdrive_auth")
+@user_login_required
+def moonreader_gdrive_auth():
+    """Start OAuth flow for current user's Moonreader Google Drive"""
+    try:
+        from . import moonreader_gdrive_utils
+        
+        if not gdriveutils.gdrive_support:
+            flash(_('Google Drive not supported'), category="error")
+            return redirect(url_for('admin.configuration'))
+        
+        # Check if main Google Drive is configured first
+        log.info(f"Looking for client_secrets.json at: {gdriveutils.CLIENT_SECRETS}")
+        if not os.path.exists(gdriveutils.CLIENT_SECRETS):
+            flash(_('Google Drive OAuth is not configured. Please set up the main Google Drive integration first by uploading client_secrets.json in the Google Drive settings.'), category="error")
+            return redirect(url_for('admin.configuration'))
+        
+        # Check if the client secrets file is valid
+        error_text = gdriveutils.get_error_text()
+        if error_text:
+            flash(_('Google Drive configuration error: ') + error_text + _(' Please check the main Google Drive settings.'), category="error")
+            return redirect(url_for('admin.configuration'))
+        
+        # Import the appropriate GoogleAuth
+        if gdriveutils.gdrive_support:
+            try:
+                from pydrive2.auth import GoogleAuth
+            except ImportError:
+                from pydrive.auth import GoogleAuth
+        else:
+            flash(_('Google Drive libraries not available'), category="error")
+            return redirect(url_for('admin.configuration'))
+        
+        # Use the existing Google Drive client secrets directly
+        import json
+        log.info(f"Attempting to open client_secrets.json at: {gdriveutils.CLIENT_SECRETS}")
+        log.info(f"File exists: {os.path.exists(gdriveutils.CLIENT_SECRETS)}")
+        log.info(f"Current working directory: {os.getcwd()}")
+        with open(gdriveutils.CLIENT_SECRETS, 'r') as f:
+            client_config = json.load(f)
+        
+        # Create GoogleAuth with direct client config
+        settings = {
+            'client_config_backend': 'settings',
+            'client_config': client_config['web'],
+            'save_credentials': False,
+            'oauth_scope': ['https://www.googleapis.com/auth/drive']
+        }
+        gauth = GoogleAuth(settings=settings)
+        
+        # Get the OAuth flow and add user_id to state parameter
+        gauth.GetFlow()
+        gauth.flow.params['state'] = f"moonreader_user_{current_user.id}"
+        
+        auth_url = gauth.GetAuthUrl()
+            
+        return redirect(auth_url)
+        
+    except Exception as e:
+        log.error(f"Error starting Moonreader Google Drive auth: {e}")
+        flash(_('Error starting Google Drive authentication'), category="error")
+        return redirect(url_for('admin.configuration'))
+
+
+@admi.route("/admin/moonreader_gdrive_callback")
+def moonreader_gdrive_callback():
+    """Handle OAuth callback and store user credentials"""
+    try:
+        auth_code = request.args.get('code')
+        state = request.args.get('state', '')
+        
+        if not auth_code:
+            flash(_('Google Drive authentication failed'), category="error")
+            return redirect(url_for('admin.configuration'))
+        
+        # Extract user_id from state parameter
+        if not state.startswith('moonreader_user_'):
+            flash(_('Invalid authentication state'), category="error")
+            return redirect(url_for('admin.configuration'))
+            
+        try:
+            user_id = int(state.replace('moonreader_user_', ''))
+        except ValueError:
+            flash(_('Invalid user ID in authentication'), category="error")
+            return redirect(url_for('admin.configuration'))
+        
+        # Import the appropriate GoogleAuth
+        if gdriveutils.gdrive_support:
+            try:
+                from pydrive2.auth import GoogleAuth
+            except ImportError:
+                from pydrive.auth import GoogleAuth
+        
+        # Use the existing Google Drive client secrets directly
+        import json
+        with open(gdriveutils.CLIENT_SECRETS, 'r') as f:
+            client_config = json.load(f)
+        
+        # Create GoogleAuth with direct client config
+        settings = {
+            'client_config_backend': 'settings',
+            'client_config': client_config['web'],
+            'save_credentials': False,
+            'oauth_scope': ['https://www.googleapis.com/auth/drive']
+        }
+        gauth = GoogleAuth(settings=settings)
+        gauth.GetFlow()
+        
+        credentials = gauth.flow.step2_exchange(auth_code)
+        
+        # Get user email from credentials
+        user_email = getattr(credentials, 'id_token', {}).get('email', 'Unknown')
+        if not user_email or user_email == 'Unknown':
+            # Try to get it from the token info
+            try:
+                import json
+                token_info = json.loads(credentials.to_json())
+                user_email = token_info.get('id_token', {}).get('email', 'Unknown')
+            except:
+                user_email = 'Unknown'
+        
+        # Store credentials in database
+        existing_creds = ub.session.query(ub.UserGdriveCredentials).filter(
+            ub.UserGdriveCredentials.user_id == user_id
+        ).first()
+        
+        if existing_creds:
+            # Update existing
+            existing_creds.credentials_json = credentials.to_json()
+            existing_creds.authenticated = True
+            existing_creds.email = user_email
+            existing_creds.last_refresh = datetime.now(timezone.utc)
+        else:
+            # Create new
+            new_creds = ub.UserGdriveCredentials(
+                user_id=user_id,
+                credentials_json=credentials.to_json(),
+                authenticated=True,
+                email=user_email,
+                folder_name="/Apps/Books/.Moon+/Cache"  # Default Moonreader folder
+            )
+            ub.session.add(new_creds)
+        
+        ub.session.commit()
+        
+        flash(_('Google Drive connected successfully!'), category="success")
+        return redirect(url_for('admin.configuration'))
+        
+    except Exception as e:
+        log.error(f"Error in Moonreader Google Drive callback: {e}")
+        flash(_('Error connecting to Google Drive'), category="error")
+        return redirect(url_for('admin.configuration'))
+
+
+@admi.route("/admin/moonreader_gdrive_disconnect", methods=["POST"])
+@user_login_required
+def disconnect_moonreader_gdrive():
+    """Remove user's Google Drive connection"""
+    try:
+        from . import moonreader_gdrive_utils
+        
+        user_gdrive = moonreader_gdrive_utils.UserGdriveAuth(current_user.id)
+        if user_gdrive.disconnect():
+            flash(_('Google Drive disconnected successfully'), category="success")
+        else:
+            flash(_('Error disconnecting Google Drive'), category="error")
+            
+    except Exception as e:
+        log.error(f"Error disconnecting Moonreader Google Drive: {e}")
+        flash(_('Error disconnecting Google Drive'), category="error")
+    
+    return redirect(url_for('admin.configuration'))
+
+
+@admi.route("/admin/moonreader_gdrive_folders")
+@user_login_required
+def get_moonreader_gdrive_folders():
+    """Return JSON list of folders for current user's Google Drive"""
+    try:
+        from . import moonreader_gdrive_utils
+        
+        user_gdrive = moonreader_gdrive_utils.UserGdriveAuth(current_user.id)
+        if not user_gdrive.is_authenticated():
+            return jsonify({'error': 'Not authenticated'})
+        
+        folders = user_gdrive.list_user_folders()
+        folder_list = [{'id': f['id'], 'title': f['title']} for f in folders]
+        
+        return jsonify({'folders': folder_list})
+        
+    except Exception as e:
+        log.error(f"Error getting Moonreader Google Drive folders: {e}")
+        return jsonify({'error': str(e)})
+
+
+@admi.route("/admin/moonreader_gdrive_set_folder", methods=["POST"])
+@user_login_required
+def set_moonreader_gdrive_folder():
+    """Set the selected folder for Moonreader sync"""
+    try:
+        from . import moonreader_gdrive_utils
+        
+        folder_path = request.form.get('folder_path', '').strip()
+        if not folder_path:
+            return jsonify({'status': 'error', 'message': _('Folder path required')})
+        
+        user_gdrive = moonreader_gdrive_utils.UserGdriveAuth(current_user.id)
+        if not user_gdrive.is_authenticated():
+            return jsonify({'status': 'error', 'message': _('Google Drive not connected')})
+        
+        # Update user's folder preference in database
+        if user_gdrive.credentials_record:
+            user_gdrive.credentials_record.folder_name = folder_path
+            ub.session.commit()
+            return jsonify({'status': 'success', 'message': _('Moonreader sync folder updated')})
+        else:
+            return jsonify({'status': 'error', 'message': _('User credentials not found')})
+            
+    except Exception as e:
+        log.error(f"Error setting Moonreader Google Drive folder: {e}")
+        return jsonify({'status': 'error', 'message': str(e)})
+
+
+@admi.route("/admin/test_gdrive_moonreader", methods=["POST"])
+@user_login_required
+def test_gdrive_moonreader_connection():
+    """Test user's Google Drive connection for Moonreader sync"""
+    try:
+        from . import moonreader_gdrive_utils
+        
+        if not gdrive_support:
+            return jsonify({'status': 'error', 'message': _('Google Drive not supported')})
+        
+        # Get user's Google Drive connection
+        user_gdrive = moonreader_gdrive_utils.UserGdriveAuth(current_user.id)
+        if not user_gdrive.is_authenticated():
+            return jsonify({'status': 'error', 'message': _('Google Drive not connected for this user')})
+        
+        # Test folder access (use user's selected folder or default)
+        folder_path = user_gdrive.credentials_record.folder_name or "/Apps/Books/.Moon+/Cache"
+        
+        # Try to get/create the Moonreader folder
+        folder_id = user_gdrive.get_folder_by_path(folder_path)
+        if folder_id:
+            return jsonify({'status': 'success', 'message': _('Google Drive connection successful - Moonreader folder ready')})
+        else:
+            return jsonify({'status': 'error', 'message': _('Could not access or create Moonreader folder')})
+            
+    except Exception as e:
+        log.error(f"Google Drive test connection error for user {current_user.id}: {e}")
+        return jsonify({'status': 'error', 'message': str(e)})
+
+
+def get_user_gdrive_status(user_id):
+    """Get per-user Google Drive status for Moonreader sync"""
+    try:
+        from . import moonreader_gdrive_utils
+        return moonreader_gdrive_utils.get_user_gdrive_status(user_id)
+    except Exception as e:
+        log.error(f"Error getting user Google Drive status: {e}")
+        return {
+            'authenticated': False,
+            'error': str(e),
+            'email': None
+        }
+
+
+def get_gdrive_status():
+    """Get Google Drive connection status for basic config"""
+    # For Moonreader, we now use per-user authentication
+    user_gdrive = get_user_gdrive_status(current_user.id)
+    
+    return {
+        'enabled': user_gdrive['authenticated'],
+        'moonreader_specific': True,  # Always per-user now
+        'database_fallback': False,
+        'authenticated': user_gdrive['authenticated'],
+        'error': user_gdrive.get('error'),
+        'supported': gdrive_support,
+        'user_email': user_gdrive.get('email')
+    }
+
+
 @admi.route("/admin/viewconfig")
 @user_login_required
 @admin_required
@@ -284,10 +571,12 @@ def view_configuration():
         .filter(and_(db.CustomColumns.datatype == 'text', db.CustomColumns.mark_for_delete == 0)).all()
     languages = calibre_db.speaking_language()
     translations = get_available_locale()
+    gdrive_status = get_gdrive_status()
     return render_title_template("config_view_edit.html", conf=config, readColumns=read_column,
                                  restrictColumns=restrict_columns,
                                  languages=languages,
                                  translations=translations,
+                                 gdrive_status=gdrive_status,
                                  title=_("UI Configuration"), page="uiconfig")
 
 
@@ -1796,6 +2085,7 @@ def _configuration_update_helper():
         reboot_required |= _config_checkbox_int(to_save, "config_kobo_sync")
         _config_int(to_save, "config_external_port")
         _config_checkbox_int(to_save, "config_kobo_proxy")
+        _config_checkbox_int(to_save, "config_moonreader_sync")
 
         if "config_upload_formats" in to_save:
             to_save["config_upload_formats"] = ','.join(

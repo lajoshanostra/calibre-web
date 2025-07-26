@@ -220,6 +220,18 @@ def HandleSyncRequest():
             "BookMetadata": get_metadata(book.Books),
         }
 
+        # Check for Moonreader position updates before sending to Kobo
+        if config.config_moonreader_sync:
+            try:
+                from . import moonreader_sync
+                moonreader_data = moonreader_sync.check_moonreader_position_updates(current_user.id, book.Books.id)
+                if moonreader_data:
+                    moonreader_sync.update_kobo_reading_state_from_moonreader(current_user.id, book.Books.id, moonreader_data)
+                    # Refresh the reading state after update
+                    kobo_reading_state = get_or_create_reading_state(book.Books.id)
+            except Exception as e:
+                log.error(f"Failed to check Moonreader position updates: {e}")
+
         if kobo_reading_state.last_modified > sync_token.reading_state_last_modified:
             entitlement["ReadingState"] = get_kobo_reading_state_response(book.Books, kobo_reading_state)
             new_reading_state_last_modified = max(new_reading_state_last_modified, kobo_reading_state.last_modified)
@@ -288,6 +300,21 @@ def HandleSyncRequest():
     for kobo_reading_state in changed_reading_states.limit(SYNC_ITEM_LIMIT).all():
         book = calibre_db.session.query(db.Books).filter(db.Books.id == kobo_reading_state.book_id).one_or_none()
         if book:
+            # Check for Moonreader position updates for changed reading states
+            if config.config_moonreader_sync:
+                try:
+                    from . import moonreader_sync
+                    moonreader_data = moonreader_sync.check_moonreader_position_updates(current_user.id, book.id)
+                    if moonreader_data:
+                        moonreader_sync.update_kobo_reading_state_from_moonreader(current_user.id, book.id, moonreader_data)
+                        # Refresh the reading state after update
+                        kobo_reading_state = ub.session.query(ub.KoboReadingState).filter(
+                            ub.KoboReadingState.user_id == current_user.id,
+                            ub.KoboReadingState.book_id == book.id
+                        ).first()
+                except Exception as e:
+                    log.error(f"Failed to check Moonreader position updates for changed reading state: {e}")
+            
             sync_results.append({
                 "ChangedReadingState": {
                     "ReadingState": get_kobo_reading_state_response(book, kobo_reading_state)
@@ -812,6 +839,15 @@ def HandleStateRequest(book_uuid):
 
         ub.session.merge(kobo_reading_state)
         ub.session_commit()
+        
+        # Sync position to Moonreader if enabled
+        if config.config_moonreader_sync:
+            try:
+                from . import moonreader_sync
+                moonreader_sync.create_position_file(book, kobo_reading_state, current_user.id)
+            except Exception as e:
+                log.error(f"Failed to sync position to Moonreader: {e}")
+        
         return jsonify({
             "RequestResult": "Success",
             "UpdateResults": [update_results_response],
