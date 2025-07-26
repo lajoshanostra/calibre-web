@@ -239,6 +239,38 @@ class UserGdriveAuth:
             log.error(f"Error downloading file {filename} for user {self.user_id}: {e}")
             return None
     
+    def list_files_in_folder(self, folder_path, pattern=None):
+        """List files in user's Google Drive folder, optionally filtered by pattern."""
+        drive = self.get_authenticated_drive()
+        if not drive:
+            return []
+            
+        try:
+            folder_id = self.get_folder_by_path(folder_path)
+            if not folder_id:
+                return []
+                
+            # Query for files in the folder
+            query = f"'{folder_id}' in parents and trashed = false and mimeType != 'application/vnd.google-apps.folder'"
+            
+            # Add pattern matching if specified
+            if pattern:
+                # Convert simple pattern like "*.epub.po" to search term
+                if pattern.startswith('*') and pattern.endswith('.epub.po'):
+                    # For pattern like "*.epub.po", just search for files ending with .epub.po
+                    query += " and title contains '.epub.po'"
+                elif pattern:
+                    # For other patterns, use contains search
+                    search_term = pattern.replace('*', '').replace('.', '\\.')
+                    query += f" and title contains '{search_term}'"
+            
+            file_list = drive.ListFile({'q': query}).GetList()
+            return file_list
+            
+        except Exception as e:
+            log.error(f"Error listing files in folder {folder_path} for user {self.user_id}: {e}")
+            return []
+
     def get_user_email(self):
         """Get the Google account email for this user"""
         if self.credentials_record:
