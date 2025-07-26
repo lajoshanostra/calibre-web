@@ -198,6 +198,13 @@
                       <h4 class="modal-title">{{_('Select Google Drive Folder')}}</h4>
                     </div>
                     <div class="modal-body">
+                      <!-- Breadcrumb Navigation -->
+                      <nav aria-label="breadcrumb">
+                        <ol class="breadcrumb" id="folder_breadcrumb">
+                          <li class="breadcrumb-item active">{{_('Root')}}</li>
+                        </ol>
+                      </nav>
+                      
                       <div id="folder_loading" style="display:none;">
                         <i class="fa fa-spinner fa-spin"></i> {{_('Loading folders...')}}
                       </div>
@@ -553,14 +560,27 @@ $(document).ready(function() {
          });
     });
     
+    // Global variables for folder navigation
+    var currentFolderId = 'root';
+    var folderPath = [];
+    
     // Folder picker functionality
     $('#browse_folders_btn').click(function() {
+        // Reset navigation state
+        currentFolderId = 'root';
+        folderPath = [];
+        updateBreadcrumb();
+        
+        $('#folderBrowserModal').modal('show');
+        loadFolders('root');
+    });
+    
+    // Function to load folders for a given parent ID
+    function loadFolders(parentId) {
         $('#folder_loading').show();
         $('#folder_list').hide();
-        $('#folderBrowserModal').modal('show');
         
-        // Load folders from user's Google Drive
-        $.get('{{ url_for("admin.get_moonreader_gdrive_folders") }}')
+        $.get('{{ url_for("admin.get_moonreader_gdrive_folders") }}', {parent_id: parentId})
          .done(function(data) {
              $('#folder_loading').hide();
              $('#folder_list').show();
@@ -570,35 +590,120 @@ $(document).ready(function() {
                  return;
              }
              
-             var folderHtml = '<div class="list-group">' +
-                             '<a href="#" class="list-group-item folder-item" data-path="/">' +
-                             '<i class="fa fa-folder"></i> {{_("Root")}}' +
-                             '</a>';
+             var folderHtml = '<div class="list-group">';
+             
+             // Add "Up" button if not at root
+             if (parentId !== 'root' && folderPath.length > 0) {
+                 var parentInfo = folderPath[folderPath.length - 1];
+                 folderHtml += '<a href="#" class="list-group-item up-folder" data-parent-id="' + (parentInfo ? parentInfo.id : 'root') + '">' +
+                              '<i class="fa fa-level-up"></i> {{_(".. (Up)")}}' +
+                              '</a>';
+             }
              
              if (data.folders && data.folders.length > 0) {
                  data.folders.forEach(function(folder) {
-                     folderHtml += '<a href="#" class="list-group-item folder-item" data-path="/' + folder.title + '">' +
+                     folderHtml += '<a href="#" class="list-group-item navigable-folder" data-folder-id="' + folder.id + '" data-folder-name="' + folder.title + '">' +
                                   '<i class="fa fa-folder"></i> ' + folder.title +
+                                  '<i class="fa fa-chevron-right pull-right" style="margin-top: 2px;"></i>' +
                                   '</a>';
                  });
              }
              
+             if (data.folders.length === 0 && parentId !== 'root') {
+                 folderHtml += '<div class="alert alert-info">{{_("No subfolders found")}}</div>';
+             }
+             
              folderHtml += '</div>';
              $('#folder_list').html(folderHtml);
+             
+             // Update current path in the text field
+             updateCurrentPath();
          })
          .fail(function() {
              $('#folder_loading').hide();
              $('#folder_list').show().html('<div class="alert alert-danger">{{_("Failed to load folders")}}</div>');
          });
+    }
+    
+    // Function to update breadcrumb navigation
+    function updateBreadcrumb() {
+        var breadcrumbHtml = '<li class="breadcrumb-item"><a href="#" class="breadcrumb-nav" data-folder-id="root">{{_("Root")}}</a></li>';
+        
+        for (var i = 0; i < folderPath.length; i++) {
+            var folder = folderPath[i];
+            if (i === folderPath.length - 1) {
+                breadcrumbHtml += '<li class="breadcrumb-item active">' + folder.name + '</li>';
+            } else {
+                breadcrumbHtml += '<li class="breadcrumb-item"><a href="#" class="breadcrumb-nav" data-folder-id="' + folder.id + '">' + folder.name + '</a></li>';
+            }
+        }
+        
+        $('#folder_breadcrumb').html(breadcrumbHtml);
+    }
+    
+    // Function to update current path display
+    function updateCurrentPath() {
+        var path = '/';
+        if (folderPath.length > 0) {
+            path = '/' + folderPath.map(f => f.name).join('/');
+        }
+        $('#custom_folder_path').val(path);
+    }
+    
+    // Navigate into a folder
+    $(document).on('click', '.navigable-folder', function(e) {
+        e.preventDefault();
+        
+        var folderId = $(this).data('folder-id');
+        var folderName = $(this).data('folder-name');
+        
+        // Add current folder to path
+        folderPath.push({id: currentFolderId, name: folderName});
+        currentFolderId = folderId;
+        
+        updateBreadcrumb();
+        loadFolders(folderId);
     });
     
-    // Folder selection
-    $(document).on('click', '.folder-item', function(e) {
+    // Navigate up one level
+    $(document).on('click', '.up-folder', function(e) {
         e.preventDefault();
-        $('.folder-item').removeClass('active');
-        $(this).addClass('active');
-        var path = $(this).data('path');
-        $('#custom_folder_path').val(path);
+        
+        if (folderPath.length > 0) {
+            var parentFolder = folderPath.pop();
+            currentFolderId = parentFolder.id;
+            updateBreadcrumb();
+            loadFolders(currentFolderId);
+        }
+    });
+    
+    // Breadcrumb navigation
+    $(document).on('click', '.breadcrumb-nav', function(e) {
+        e.preventDefault();
+        
+        var targetFolderId = $(this).data('folder-id');
+        
+        // Find position in path and truncate
+        if (targetFolderId === 'root') {
+            folderPath = [];
+            currentFolderId = 'root';
+        } else {
+            var targetIndex = -1;
+            for (var i = 0; i < folderPath.length; i++) {
+                if (folderPath[i].id === targetFolderId) {
+                    targetIndex = i;
+                    break;
+                }
+            }
+            
+            if (targetIndex >= 0) {
+                folderPath = folderPath.slice(0, targetIndex + 1);
+                currentFolderId = targetFolderId;
+            }
+        }
+        
+        updateBreadcrumb();
+        loadFolders(currentFolderId);
     });
     
     // Select folder button

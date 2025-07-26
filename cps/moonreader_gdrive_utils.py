@@ -133,18 +133,18 @@ class UserGdriveAuth:
             log.error(f"Error creating Google Drive instance for user {self.user_id}: {e}")
             return None
     
-    def list_user_folders(self):
-        """List folders in user's Google Drive"""
+    def list_user_folders(self, parent_id='root'):
+        """List folders in user's Google Drive under a specific parent"""
         drive = self.get_authenticated_drive()
         if not drive:
             return []
             
         try:
-            folder_query = "'root' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+            folder_query = f"'{parent_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
             file_list = drive.ListFile({'q': folder_query}).GetList()
             return file_list
         except Exception as e:
-            log.error(f"Error listing folders for user {self.user_id}: {e}")
+            log.error(f"Error listing folders for user {self.user_id} under parent {parent_id}: {e}")
             return []
     
     def get_folder_by_path(self, path):

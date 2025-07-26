@@ -494,10 +494,13 @@ def get_moonreader_gdrive_folders():
         if not user_gdrive.is_authenticated():
             return jsonify({'error': 'Not authenticated'})
         
-        folders = user_gdrive.list_user_folders()
-        folder_list = [{'id': f['id'], 'title': f['title']} for f in folders]
+        # Get parent folder ID from query parameter (default to 'root')
+        parent_id = request.args.get('parent_id', 'root')
         
-        return jsonify({'folders': folder_list})
+        folders = user_gdrive.list_user_folders(parent_id)
+        folder_list = [{'id': f['id'], 'title': f['title'], 'parent_id': parent_id} for f in folders]
+        
+        return jsonify({'folders': folder_list, 'parent_id': parent_id})
         
     except Exception as e:
         log.error(f"Error getting Moonreader Google Drive folders: {e}")
