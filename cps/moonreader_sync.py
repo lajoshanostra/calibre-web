@@ -22,6 +22,7 @@ import re
 from datetime import datetime, timezone
 from . import logger, config, ub, db
 from .gdriveutils import getFileFromEbooksFolder, uploadFileToEbooksFolder
+from .book_analyzer import book_analyzer
 import tempfile
 
 log = logger.create()
@@ -137,7 +138,7 @@ def get_epub_content_length(book):
         return 200000
 
 def kobo_to_moonreader_position(kobo_reading_state, book=None):
-    """Convert Kobo reading state to Moonreader .epub.po format.
+    """Convert Kobo reading state to Moonreader .epub.po format using file-based analysis.
     
     Moonreader format: timestamp*chapter@scrolled_chars#screen_offset:percentage%
     - timestamp: Unix timestamp in milliseconds
@@ -154,196 +155,161 @@ def kobo_to_moonreader_position(kobo_reading_state, book=None):
     # Use last_modified timestamp in milliseconds
     timestamp = int(kobo_reading_state.last_modified.timestamp() * 1000)
     
+    log.info(f"Converting Kobo position - location: '{bookmark.location_value}', source: '{bookmark.location_source}', progress: {bookmark.progress_percent}%")
+    
+    # Use the new source-aware parsing approach
+    position_info = None
+    if book and bookmark.location_value:
+        try:
+            # Parse Kobo location with source file information
+            kobo_location_info = book_analyzer.parse_kobo_location_with_source(
+                str(bookmark.location_value), 
+                bookmark.location_source
+            )
+            
+            if kobo_location_info and (kobo_location_info.get('source_chapter') or kobo_location_info.get('source_split')):
+                span_x = kobo_location_info['span_x']
+                span_y = kobo_location_info['span_y']
+                
+                # Handle different source file formats
+                if kobo_location_info.get('source_chapter'):
+                    # Direct Chapter format (e.g., Chapter09.xhtml)
+                    source_chapter = kobo_location_info['source_chapter']
+                    chapter = source_chapter - 1  # Convert to 0-based
+                    log.info(f"Using direct chapter mapping: Chapter{source_chapter} → chapter {chapter}")
+                    
+                elif kobo_location_info.get('source_split'):
+                    # Split file format (e.g., The_Stranger_split_7.html)
+                    split_number = kobo_location_info['source_split']
+                    toc_index = book_analyzer.map_split_to_chapter(split_number, book)
+                    
+                    if toc_index is not None:
+                        # MoonReader expects 1-based chapter numbering
+                        # TOC index is 0-based, so add 1
+                        chapter = toc_index + 1
+                        log.info(f"Mapped split_{split_number} to TOC index {toc_index} → MoonReader chapter {chapter}")
+                    else:
+                        log.warning(f"Could not map split_{split_number} to chapter, using fallback")
+                        chapter = 1  # Fallback to chapter 1
+                else:
+                    chapter = 0  # Fallback
+                
+                # Estimate position within chapter based on span numbers
+                # This is a rough estimate - could be improved with more analysis
+                scrolled_chars = span_x * 10  # Simple estimation
+                screen_offset = span_y
+                
+                # Calculate chapter progress from book progress and chapter position
+                # If we know total chapters, we can calculate chapter progress
+                try:
+                    file_paths = book_analyzer.get_book_files(book)
+                    if 'epub' in file_paths:
+                        epub_structure = book_analyzer.analyze_epub_structure(file_paths['epub'])
+                        if epub_structure and epub_structure.total_chapters > 0:
+                            total_chapters = epub_structure.total_chapters
+                            chapter_size_percent = 100.0 / total_chapters
+                            
+                            # Calculate chapter start percentage
+                            chapter_start_percent = chapter * chapter_size_percent
+                            
+                            # Calculate how much of this chapter we've read
+                            if bookmark.progress_percent > chapter_start_percent:
+                                chapter_progress = ((bookmark.progress_percent - chapter_start_percent) / chapter_size_percent) * 100
+                                chapter_progress = max(0.0, min(100.0, chapter_progress))
+                            else:
+                                chapter_progress = 0.0
+                        else:
+                            # Fallback estimation
+                            chapter_progress = 10.0  # Conservative estimate
+                    else:
+                        chapter_progress = 10.0
+                except Exception:
+                    chapter_progress = 10.0
+                
+                # Create appropriate log message
+                if kobo_location_info.get('source_chapter'):
+                    log.info(f"Source-based analysis: Chapter{kobo_location_info['source_chapter']} → chapter {chapter}, span {span_x}.{span_y}, progress {chapter_progress:.1f}%")
+                elif kobo_location_info.get('source_split'):
+                    log.info(f"Source-based analysis: split_{kobo_location_info['source_split']} → chapter {chapter}, span {span_x}.{span_y}, progress {chapter_progress:.1f}%")
+                
+            else:
+                # Fallback to original analysis method
+                progress_percent = bookmark.progress_percent if bookmark.progress_percent else None
+                position_info = book_analyzer.map_kobo_position_to_epub(str(bookmark.location_value), book, progress_percent)
+                if position_info:
+                    chapter = position_info.chapter
+                    scrolled_chars = position_info.paragraph
+                    screen_offset = position_info.character_offset
+                    chapter_progress = position_info.chapter_progress
+                    log.info(f"File-based analysis successful - chapter: {chapter}, progress: {chapter_progress:.1f}%")
+                else:
+                    # Final fallback
+                    chapter, scrolled_chars, screen_offset, chapter_progress = _estimate_position_fallback(bookmark, book)
+                    log.warning(f"Using fallback estimation")
+        except Exception as e:
+            log.warning(f"Source-aware analysis failed: {e}, falling back to estimation")
+            chapter, scrolled_chars, screen_offset, chapter_progress = _estimate_position_fallback(bookmark, book)
+    
+    log.info(f"Final position - chapter: {chapter}, scrolled_chars: {scrolled_chars}, screen_offset: {screen_offset}, chapter_progress: {chapter_progress:.1f}%")
+    return f"{timestamp}*{chapter}@{scrolled_chars}#{screen_offset}:{chapter_progress:.1f}%"
+
+
+def _estimate_position_fallback(bookmark, book=None):
+    """Fallback position estimation when file analysis fails."""
+    chapter = 0
+    scrolled_chars = 0
+    screen_offset = 0
+    chapter_progress = 0.0
+    
     # Detect book format for proper location parsing
     book_format = get_book_format(book) if book else 'epub'
     
-    # Extract chapter and position based on format
-    chapter = 0
-    scrolled_chars = 0  # This should usually be 0 unless we're deep into a chapter
-    screen_offset = 0
-    
-    # Add detailed logging for debugging
-    log.info(f"Converting Kobo position - book_format: {book_format}, location_value: '{bookmark.location_value}', progress: {bookmark.progress_percent}%")
-    
     if bookmark.location_value:
-        if book_format == 'kepub' and '!' in str(bookmark.location_value):
-            # Parse .kepub ContentID format
-            try:
-                location_str = str(bookmark.location_value)
-                log.debug(f"Parsing kepub location: {location_str}")
-                
-                # Extract chapter from path - try multiple patterns
-                chapter_found = False
-                
-                # Pattern 1: Chapter1.xhtml, chapter1.html, etc.
-                chapter_match = re.search(r'[Cc]hapter[-_]?(\d+)', location_str)
-                if chapter_match:
-                    chapter = max(0, int(chapter_match.group(1)) - 1)
-                    chapter_found = True
-                    log.debug(f"Found chapter via Chapter pattern: {chapter}")
-                
-                # Pattern 2: Numbered files like 001.xhtml, part2.html, etc.
-                if not chapter_found:
-                    file_match = re.search(r'/(?:part|section|ch)?[-_]?(\d+)\.x?html?', location_str, re.IGNORECASE)
-                    if file_match:
-                        chapter = max(0, int(file_match.group(1)) - 1)
-                        chapter_found = True
-                        log.debug(f"Found chapter via numbered file pattern: {chapter}")
-                
-                # Pattern 3: Extract from full path structure
-                if not chapter_found:
-                    path_match = re.search(r'/(?:text|content|html)/[^/]*?(\d+)', location_str, re.IGNORECASE)
-                    if path_match:
-                        chapter = max(0, int(path_match.group(1)) - 1)
-                        chapter_found = True
-                        log.debug(f"Found chapter via path pattern: {chapter}")
-                
-                # Fallback: Estimate chapter from progress if no pattern matched
-                if not chapter_found and bookmark.progress_percent:
-                    # Use a higher chapter estimate to better match MoonReader's counting
-                    # MoonReader seems to use finer chapter granularity
-                    estimated_chapters = 50  # Increased from 40
-                    chapter = int((bookmark.progress_percent / 100.0) * estimated_chapters)
-                    chapter_found = True
-                    log.info(f"Estimated chapter from progress: {chapter} (progress: {bookmark.progress_percent}%, using {estimated_chapters} max chapters)")
-                
-                # Extract position from kobo fragment
-                kobo_match = re.search(r'#kobo\.(\d+)\.(\d+)', location_str)
-                if kobo_match:
-                    kobo_chapter_ref = int(kobo_match.group(1))
-                    kobo_position = int(kobo_match.group(2))
-                    
-                    # If we found a chapter reference in the kobo fragment, use it as fallback
-                    if not chapter_found and kobo_chapter_ref > 0:
-                        chapter = max(0, kobo_chapter_ref - 1)
-                        log.debug(f"Using kobo fragment chapter reference: {chapter}")
-                    
-                    # For MoonReader scrolled_chars: this should represent how much has been 
-                    # scrolled past in the current view, NOT total book progress
-                    # If we're at a chapter boundary or start, this should be 0
-                    # Only use kobo_position if it's small (indicating position within chapter)
-                    if kobo_position < 5000:  # Arbitrary threshold for "within chapter"
-                        scrolled_chars = kobo_position // 10  # Scale down significantly
-                        screen_offset = kobo_position % 100
-                    else:
-                        # Large kobo_position might indicate we're at chapter start
-                        scrolled_chars = 0
-                        screen_offset = 0
-                else:
-                    # No kobo fragment found - assume we're at chapter start
-                    scrolled_chars = 0
-                    screen_offset = 0
-                    
-                log.debug(f"Kepub parsed - chapter: {chapter}, scrolled_chars: {scrolled_chars}, screen_offset: {screen_offset}")
-                    
-            except (ValueError, AttributeError) as e:
-                log.info(f"Failed to parse .kepub location_value '{bookmark.location_value}': {e}")
-                # Fallback: estimate chapter from progress
-                if bookmark.progress_percent:
-                    chapter = int((bookmark.progress_percent / 100.0) * 50)
-                    log.info(f"Exception fallback - estimated chapter from progress: {chapter} (progress: {bookmark.progress_percent}%)")
-                else:
-                    chapter = 0
-                scrolled_chars = 0
-                screen_offset = 0
-        else:
-            # Parse .epub format (when MoonReader updates are coming back to Kobo)
-            try:
-                log.info(f"Parsing epub location: {bookmark.location_value}")
-                
-                chapter_found = False
-                
-                if '/' in str(bookmark.location_value):
-                    parts = str(bookmark.location_value).split('/')
-                    if parts[0].isdigit():
-                        chapter = max(0, int(parts[0]) - 1)
-                        chapter_found = True
-                    
-                    if len(parts) > 1 and parts[1].isdigit():
-                        position = int(parts[1])
-                        # For epub, keep scrolled_chars small - it's not total book progress
-                        scrolled_chars = position // 100  # Much smaller scaling
-                        screen_offset = position % 100
-                else:
-                    # Single number format
-                    position_match = re.search(r'\d+', str(bookmark.location_value))
-                    if position_match:
-                        position = int(position_match.group())
-                        scrolled_chars = position // 50  # Keep small
-                        screen_offset = position % 50
-                
-                # Fallback: estimate chapter from progress if not found
-                if not chapter_found and bookmark.progress_percent:
-                    chapter = int((bookmark.progress_percent / 100.0) * 50)
-                    log.info(f"Epub fallback - estimated chapter from progress: {chapter} (progress: {bookmark.progress_percent}%)")
-                        
-                log.info(f"Epub parsed - chapter: {chapter}, scrolled_chars: {scrolled_chars}, screen_offset: {screen_offset}")
-                        
-            except (ValueError, AttributeError) as e:
-                log.info(f"Failed to parse epub location_value '{bookmark.location_value}': {e}")
-                # Even in exception, try progress estimation
-                if bookmark.progress_percent:
-                    chapter = int((bookmark.progress_percent / 100.0) * 50)
-                    log.info(f"Epub exception fallback - estimated chapter from progress: {chapter} (progress: {bookmark.progress_percent}%)")
-                else:
-                    chapter = 0
-                scrolled_chars = 0
-                screen_offset = 0
-    else:
-        # No location_value at all - estimate from progress if available
+        # Simplified fallback - basic chapter estimation from progress
         if bookmark.progress_percent:
-            chapter = int((bookmark.progress_percent / 100.0) * 40)
-            log.info(f"No location_value - estimated chapter from progress: {chapter}")
-        else:
-            chapter = 0
-            log.info("No location_value and no progress - defaulting to chapter 0")
-    
-    # Progress percentage - MoonReader uses CHAPTER progress, not book progress
-    # Since Kobo's progress_percent is likely for the entire book, we need to estimate chapter progress
-    # This is challenging without knowing the actual chapter structure
-    
-    if bookmark.progress_percent:
-        # Try to estimate chapter progress from book progress and chapter number
-        book_progress = bookmark.progress_percent
+            estimated_chapters = 50  # Default estimation
+            chapter = int((bookmark.progress_percent / 100.0) * estimated_chapters)
+            log.info(f"Fallback estimation - chapter: {chapter} from progress: {bookmark.progress_percent}%")
         
-        # If we know the chapter and have position info, try to estimate chapter progress
-        if chapter > 0:
-            # Rough estimate: if we're in chapter N, assume each chapter is roughly equal
-            # and calculate where we are within this chapter
-            estimated_chapters = 50  # Same as our chapter estimation
-            chapter_start_percent = (chapter / estimated_chapters) * 100
-            chapter_end_percent = ((chapter + 1) / estimated_chapters) * 100
-            
-            # Calculate progress within this chapter
-            if book_progress >= chapter_start_percent:
-                chapter_range = chapter_end_percent - chapter_start_percent
-                progress_in_range = book_progress - chapter_start_percent
-                chapter_progress = (progress_in_range / chapter_range) * 100
-                
-                # Clamp to reasonable values
-                chapter_progress = max(0.0, min(100.0, chapter_progress))
-            else:
-                # We're somehow before this chapter start, assume beginning of chapter
-                chapter_progress = 0.0
-        else:
-            # Chapter 0 or unknown, assume early in chapter
-            chapter_progress = min(book_progress * 2, 100.0)  # Scale up for early chapters
-        
-        progress = chapter_progress
-        log.info(f"Converted book progress {book_progress}% to chapter {chapter} progress {progress:.1f}%")
+        # Extract basic position info if available
+        if book_format == 'kepub' and '!' in str(bookmark.location_value):
+            kobo_match = re.search(r'#kobo\.(\d+)\.(\d+)', str(bookmark.location_value))
+            if kobo_match:
+                kobo_position = int(kobo_match.group(2))
+                scrolled_chars = min(kobo_position // 100, 50)  # Keep small
+                screen_offset = kobo_position % 100
+        elif '/' in str(bookmark.location_value):
+            parts = str(bookmark.location_value).split('/')
+            if len(parts) >= 2 and parts[1].isdigit():
+                position = int(parts[1])
+                scrolled_chars = min(position // 100, 50)
+                screen_offset = position % 100
     else:
-        progress = 0.0
+        # No location_value - estimate from progress only
+        if bookmark.progress_percent:
+            chapter = int((bookmark.progress_percent / 100.0) * 50)
+            log.info(f"No location_value - estimated chapter: {chapter} from progress: {bookmark.progress_percent}%")
     
-    # Final sanity check: scrolled_chars should be small for MoonReader
-    if scrolled_chars > 10000:  # Arbitrary large number threshold
-        log.debug(f"Scrolled chars too large ({scrolled_chars}), resetting to 0")
-        scrolled_chars = 0
+    # Estimate chapter progress from book progress (simplified fallback)
+    if bookmark.progress_percent and chapter >= 0:
+        estimated_chapters = 50
+        chapter_start_percent = (chapter / estimated_chapters) * 100
+        chapter_end_percent = ((chapter + 1) / estimated_chapters) * 100
+        chapter_range = chapter_end_percent - chapter_start_percent
+        
+        if bookmark.progress_percent >= chapter_start_percent:
+            progress_in_range = bookmark.progress_percent - chapter_start_percent
+            chapter_progress = (progress_in_range / chapter_range) * 100
+            chapter_progress = max(0.0, min(100.0, chapter_progress))
+        else:
+            chapter_progress = 0.0
+    else:
+        chapter_progress = 0.0
     
-    log.info(f"Final MoonReader position: {timestamp}*{chapter}@{scrolled_chars}#{screen_offset}:{progress:.1f}%")
-    return f"{timestamp}*{chapter}@{scrolled_chars}#{screen_offset}:{progress:.1f}%"
+    return chapter, scrolled_chars, screen_offset, chapter_progress
 
 def moonreader_to_kobo_position(moonreader_content, book=None):
-    """Parse Moonreader .epub.po format back to Kobo position data.
+    """Parse Moonreader .epub.po format back to Kobo position data using file-based analysis.
     
     Note: MoonReader percentage is chapter progress, not book progress.
     We need to convert this back to estimated book progress for Kobo.
@@ -353,7 +319,7 @@ def moonreader_to_kobo_position(moonreader_content, book=None):
     
     try:
         content = moonreader_content.strip()
-        log.debug(f"Parsing MoonReader content: {content}")
+        log.info(f"Parsing MoonReader content: {content}")
         
         # Parse format: timestamp*chapter@scrolled_chars#screen_offset:percentage%
         parts = re.match(r'(\d+)\*(\d+)@(\d+)#(\d+):([0-9.]+)%', content)
@@ -361,51 +327,91 @@ def moonreader_to_kobo_position(moonreader_content, book=None):
             log.warning(f"Invalid Moonreader position format: {content}")
             return None
         
-        timestamp_ms, chapter, scrolled_chars, screen_offset, progress = parts.groups()
+        timestamp_ms, chapter, scrolled_chars, screen_offset, chapter_progress = parts.groups()
         
-        # Convert zero-based chapter to 1-based for Kobo
-        kobo_chapter = int(chapter) + 1
+        # Try file-based analysis for accurate chapter count
+        actual_chapters = None
+        if book:
+            try:
+                file_paths = book_analyzer.get_book_files(book)
+                if 'epub' in file_paths:
+                    epub_structure = book_analyzer.analyze_epub_structure(file_paths['epub'])
+                    if epub_structure:
+                        actual_chapters = epub_structure.total_chapters
+                        log.info(f"File-based analysis found {actual_chapters} chapters")
+            except Exception as e:
+                log.warning(f"File-based chapter analysis failed: {e}")
         
-        # Convert scrolled characters back to position more intelligently
-        total_content_length = get_epub_content_length(book)
-        progress_ratio = float(progress) / 100.0
-        
-        # Estimate position based on scrolled characters and screen offset
-        # The scrolled_chars represents content already read, so we add screen_offset
-        estimated_char_position = int(scrolled_chars) + int(screen_offset)
-        
-        # Convert to a position relative to chapter
-        # This is still an approximation, but better than the original
-        chapter_relative_position = estimated_char_position % 10000  # Assume max 10k chars per chapter
+        # Use actual chapter count if available, otherwise fall back to estimation
+        estimated_chapters = actual_chapters if actual_chapters else 50
         
         # Convert chapter progress back to estimated book progress
-        estimated_chapters = 50  # Same as our chapter estimation
-        chapter_progress = float(progress)
+        chapter_num = int(chapter)
+        chapter_progress_val = float(chapter_progress)
         
         # Calculate estimated book progress from chapter and chapter progress
-        chapter_start_percent = (int(chapter) / estimated_chapters) * 100
+        chapter_start_percent = (chapter_num / estimated_chapters) * 100
         chapter_range_percent = (1 / estimated_chapters) * 100
-        book_progress = chapter_start_percent + (chapter_progress / 100.0) * chapter_range_percent
+        book_progress = chapter_start_percent + (chapter_progress_val / 100.0) * chapter_range_percent
         
         # Clamp to reasonable values
         book_progress = max(0.0, min(100.0, book_progress))
         
-        log.debug(f"Parsed - chapter: {chapter} (MR) -> {kobo_chapter} (Kobo), chapter_progress: {chapter_progress}% -> book_progress: {book_progress:.1f}%")
+        log.info(f"Converted MR chapter {chapter_num} ({chapter_progress_val}%) to book progress {book_progress:.1f}% (using {estimated_chapters} total chapters)")
         
         # Detect book format for proper location_value generation
         book_format = get_book_format(book) if book else 'epub'
         
         if book_format == 'kepub':
-            # Generate .kepub ContentID format
-            book_filename = sanitize_filename(book.title) if book and hasattr(book, 'title') else 'book'
+            # Generate .kepub ContentID format using algorithmic approach
+            try:
+                file_paths = book_analyzer.get_book_files(book)
+                if 'kepub' in file_paths:
+                    # Count total spans and map progress to actual position
+                    total_spans = book_analyzer.count_total_kobo_spans(file_paths['kepub'])
+                    if total_spans > 0:
+                        # Calculate target span based on book progress
+                        target_span_number = int((book_progress / 100.0) * total_spans)
+                        target_span_number = max(1, min(total_spans, target_span_number))  # Clamp to valid range
+                        
+                        # Map progress to actual EPUB chapter
+                        epub_chapter = book_analyzer.map_progress_to_epub_chapter(book_progress, book)
+                        if epub_chapter is not None:
+                            # Generate valid location using actual chapter and span
+                            book_filename = sanitize_filename(book.title) if book and hasattr(book, 'title') else 'book'
+                            location_value = f"{book_filename}.kepub.epub!OEBPS/Text/Chapter{epub_chapter + 1:02d}.xhtml#kobo.{target_span_number}.1"
+                            log.info(f"Algorithmic mapping: {book_progress:.1f}% → span {target_span_number}/{total_spans} → Chapter{epub_chapter + 1:02d}")
+                        else:
+                            # Fallback to simple format
+                            location_value = f"kobo.{target_span_number}.1"
+                            log.warning(f"Could not map to EPUB chapter, using simple span reference: {location_value}")
+                    else:
+                        # Fallback if span counting fails
+                        location_value = f"kobo.1.1"
+                        log.warning("Could not count spans, using default position")
+                else:
+                    # Fallback if KEPUB file not found
+                    location_value = f"kobo.1.1"
+                    log.warning("KEPUB file not found, using default position")
+            except Exception as e:
+                log.error(f"Error in algorithmic mapping: {e}")
+                location_value = f"kobo.1.1"
             
-            # Use the estimated position in the kobo format
-            location_value = f"{book_filename}.kepub.epub!OEBPS/Text/Chapter{kobo_chapter}.xhtml#kobo.{kobo_chapter}.{chapter_relative_position}"
-            location_type = 'kobo'
+            location_type = 'KoboSpan'
             location_source = 'calibre-web'
         else:
-            # Use simple .epub format
-            location_value = f"{kobo_chapter}/{chapter_relative_position}"
+            # Use simple .epub format - use actual chapter number from EPUB structure
+            try:
+                epub_chapter = book_analyzer.map_progress_to_epub_chapter(book_progress, book)
+                if epub_chapter is not None:
+                    kobo_chapter = epub_chapter + 1  # Convert to 1-based
+                else:
+                    kobo_chapter = int(chapter) + 1  # Fallback to original logic
+            except:
+                kobo_chapter = int(chapter) + 1  # Fallback to original logic
+            
+            estimated_position = int(scrolled_chars) * 100 + int(screen_offset)
+            location_value = f"{kobo_chapter}/{estimated_position}"
             location_type = 'text'
             location_source = 'moonreader'
         
